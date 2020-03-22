@@ -183,13 +183,16 @@ def handle_map(map_path):
         
         # Read the resources from the map BSP file
         read_bsp(map_path)
-
-        do_lowercase = config_data['resources']['enforce_lowercase']
-        map_name = map_file_info['name']
         
-        # First lets set the resources in the list to lowercase
+        # First lets set the resources in the list to lowercase if enforced
+        # Usually servers and http fast downloads are linux, which is case sensitive. Clients are windows, which is not
+        # A problem is caused when the case of the file and the string in the entity are different. The server won't find the file.
+        # Note: Sometimes mappers re-use the same resource with different case too, which becomes a mess.
+        # Easiest solution is to enforce lowercase on all files, and write this back to the bsp file below
+        do_lowercase = config_data['resources']['enforce_lowercase']
         if do_lowercase:
                 custom_resources = [resource.lower() for resource in custom_resources]
+                map_name = map_file_info['name'] = map_file_info['name'].lower()
 
         print("------------------------------------" + map_name + "------------------------------------")
 
@@ -202,7 +205,7 @@ def handle_map(map_path):
                 print("[DONE] Created resource file " + map_name + ".res. Total: " + str(resource_count) + " custom resources")
 
         # Add these resources after the res file is generated, because we want to include them in the process below
-                add_resource("maps/" + map_name + '.res')
+                add_resource("maps/" + map_name + '.res') # Only add if resource count != 0 as it won't be generated if no resources
         add_resource('maps/' + map_name + '.bsp')
         add_resource('maps/' + map_name + '.txt')
 
@@ -211,6 +214,7 @@ def handle_map(map_path):
                 custom_resources = [resource.lower() for resource in custom_resources]
 
         # Check if the resources exists locally
+        # TODO: On linux if the file case doesn't match it will return False. Maybe we need to grab the file regardless of case so it can be renamed below
         missing_resource = False
         if config_data['resources']['check_exists']:
                 for file in custom_resources:
@@ -222,17 +226,11 @@ def handle_map(map_path):
                                         print("[ERROR] Local file not found: " + file)
                                         missing_resource = True
 
-        # Enforce lowercase on resources.
-        # Usually servers and http fast downloads are linux, which is case sensitive. Clients are windows, which is not
-        # A problem is caused when the case of the file and the string in the entity are different. The server won't find the file.
-        # Note: Sometimes mappers re-use the same resource with different case too, which becomes a mess.
-        # Easiest solution is to enforce lowercase on all files, and write this back to the bsp file
         if do_lowercase:
-                # Change the resources on the disk lowercase
-                set_lowercase_disk_resources()
+                set_lowercase_disk_resources() # Change the resources on the disk lowercase
 
                 # Write back the resources as lowercase in the bsp entdata
-                # This also fixes situations where a mapper uses '\' instead of '/'. The engine sees '\' as an escape char.
+                # This function also fixes situations where a mapper uses '\' instead of '/'. The engine sees '\' as an escape char.
                 if config_data['resources']['entdata_writeback']:
                         set_lowercase_entdata_writeback()
                         print("[DONE] Wrote sanitized entdata to " + map_name + ".bsp. Total: " + str(map_file_info['entdata_size']) + " bytes")
