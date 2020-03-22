@@ -1,13 +1,10 @@
-import struct
-import os
-import zipfile
-from chardet import detect
-
+import struct                   # Working with the files in binary
+import os                       # Numerous file functions 
+import zipfile                  # Outputting map archive
+import json                     # Config file
+import re                       # Entdata lowercase writeback
+from chardet import detect      # Detecting the entdata charset
 #import cProfile
-
-ROOT_GAME_DIR = "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Half-Life\\tfc_downloads\\" # The path to use for resources
-MOD_NAME = "tfc"  # Hardcoded for now. This changes the default resource files read
-#ENFORCE_LOWERCASE = 1
 
 skybox_sides = [ "up", "dn", "lf", "rt", "ft", "bk" ] # The 6 sides of the skybox files
 file_types = [ "wad", "tga", "spr", "mdl", "wav" ] # The file types that relate to external resources we want to capture
@@ -19,19 +16,19 @@ custom_resources = []
 resource_warnings = []
 map_file_info = {}
 
-# Note: HL resources always uses '/' for path seperators regardless of system
 def read_bsp(filename):
         map_file_info['external_wad'] = False
-        map_name = map_file_info['name'] = os.path.splitext(os.path.basename(filename))[0]
-                     
+        map_file_info['name'] = os.path.splitext(os.path.basename(filename))[0]
+        map_file_info['filename'] = filename
+
         file_handle = open(filename, mode='rb')
-        bsp_version = read_int(file_handle)
+        bsp_version = map_file_info['bsp_version'] = read_int(file_handle)
         if bsp_version != 30: # Check the BSP version before processing the rest of the file
                 print('Error: Unexpected BSP version. Check file is a goldsrc map')
                 return 1
 
         # Get the entdata offset and size
-        entdata_start = read_int(file_handle)      
+        entdata_start = map_file_info['entdata_start'] = read_int(file_handle)      
         entdata_size = map_file_info['entdata_size'] = read_int(file_handle)
         
         # Seek past the planes lumpinfo and read the file offset for the texture data
@@ -40,12 +37,12 @@ def read_bsp(filename):
 
         # First int is the number of textures
         file_handle.seek(tex_data_start) 
-        tex_count = map_file_info['entdata_size'] = read_int(file_handle)
+        tex_count = map_file_info['tex_count'] = read_int(file_handle)
 
         # Next x * int blocks are the offsets for each texture. x = texture count
         tex_offset_format = str(tex_count) + 'i' # x * int
         tex_offset_len = struct.calcsize(tex_offset_format) # Get total size of texture offsets number of bytes for x * int
-        tex_offset_data = struct.unpack(tex_offset_format, file_handle.read(tex_offset_len)) # Read hte offsets
+        tex_offset_data = struct.unpack(tex_offset_format, file_handle.read(tex_offset_len)) # Read the offsets
          
         for tex_offset in tex_offset_data:
 
@@ -55,7 +52,6 @@ def read_bsp(filename):
                 
                 # Loop through each mip offset. If the offsets for each mip level are 0 the texture must be in a external texture file
                 for tex_mip_offset in tex_mip_offsets:
-                        
                         if tex_mip_offset == 0:
                                 map_file_info['external_wad'] = True
                                 break # I want to break out twice since we know textures are external now. Using the below statements to do this.
@@ -65,19 +61,19 @@ def read_bsp(filename):
                 
         # Seek to the location of the entity data and calculate end offset of entdata
         file_handle.seek(entdata_start) 
-        entdata_offset_end = entdata_start + entdata_size
 
-        # Read the entity data and grab the encoding, this is usually acsii, but sometimes not.
-        entdata = file_handle.read(entdata_size) 
-        map_file_info['entdata_encoding'] = detect(entdata)['encoding']
-        entdata = entdata.splitlines()
-        for line in entdata:        
+        # Read the entity data and create an .ent file 
+        entdata_raw = map_file_info['entdata_raw'] = file_handle.read(entdata_size)
+
+        # Grab the encoding for later decoding, this is usually acsii, but sometimes not.
+        entdata_encoding = map_file_info['entdata_encoding'] = detect(entdata_raw)['encoding']
+        entdata_lines = entdata_raw.splitlines()
+        for line in entdata_lines:        
                 if line[0] == 0 or line[0] == 123 or line[0] == 125: # Ignore 0x0, { and }
                         continue
 
-                # Convert the raw bytes to a string and strip whitespace from end
-                # Typically \n, but instances of \r
-                line = line.decode(map_file_info['entdata_encoding']).rstrip()
+                # Convert the raw bytes to a string and strip whitespace from end. Typically \n, but instances of \r depending on compiler I guess.
+                line = line.decode(entdata_encoding).rstrip()
 
                 keyvalue_pair = line.split(' ', 1)
                 ent_key = keyvalue_pair[0].strip('"')
@@ -102,11 +98,11 @@ def read_bsp(filename):
                         # This helps filter out all the values like "speed" "1000.5"
                         ent_value_len = len(ent_value)
                         if ent_value_len > 4 and ent_value[ent_value_len - 4] == '.':
-
                                 # Check if it's a file type we should include
                                 extension = os.path.splitext(ent_value)[1].lstrip('.')
                                 if extension in file_types:
-                                        if extension == 'wav': # Sound files are missing the base directory, add it.
+                                        #print(keyvalue_pair)
+                                        if extension == 'wav': # Sound files are missing the parent directory, add it.
                                                 ent_value = 'sound/' + ent_value
                                         add_resource(ent_value)
         file_handle.close()
@@ -125,8 +121,14 @@ def add_resource(resource):
                 if resource.find(bad_string) != -1:
                         resource_warnings.append("Bad string in value: " + resource)
 
+        # Note: Paths in hlds / bsp always uses '/' for path seperators regardless of system. '\' is an escape character. 
+        # Sometimes mappers screw up. e.g. "ambience\zhans.wav" equates to ambience\hans.wav'
+        # The server will fail to transmit the file to the clients. So lets fix this in the .res file
+        # The BSP also needs fixing. If the person running this script enables entdata_writeback, we'll fix it there!
+        resource = resource.replace("\\", "/")
+
         # Check if the resource exists locally
-        if is_exist_locally(resource) == 0:
+        if config_data['resources']['check_exists'] and is_exist_locally(resource) == 0:
                 resource_warnings.append("File not found: " + resource)
 
         # Add to custom resource list
@@ -142,7 +144,7 @@ def read_default_resources():
         global  default_resources
         
         for file_type in file_types:
-                default_resource_file = 'default' + os.path.sep  + MOD_NAME + '_' + file_type + '.ini'
+                default_resource_file = 'default' + os.path.sep  + config_data['game']['mod'] + '_' + file_type + '.ini'
                 file = open(script_directory + os.path.sep + default_resource_file, 'r')
                 default_resources += file.read().splitlines()
                 file.close()
@@ -150,7 +152,7 @@ def read_default_resources():
         return len(default_resources)
 
 def has_mdl_external_texture(resource):
-        model_path = ROOT_GAME_DIR + os.path.sep + resource
+        model_path = config_data['resources']['input_dir'] + os.path.sep + resource
         try:
                 file_handle = open(model_path, mode='rb')
         except:
@@ -171,29 +173,54 @@ def is_default_resource(resource):
 
 def read_all_maps():        
         map_paths = []
-        for r, d, f in os.walk(ROOT_GAME_DIR + os.path.sep + 'maps'):
+        for r, d, f in os.walk(config_data['resources']['input_dir'] + os.path.sep + 'maps'):
                 for file in f:
                         if '.bsp' in file:
                                 map_paths.append(os.path.join(r, file))
 
         for map_path in map_paths:
-                read_bsp(map_path)
+                handle_map(map_path)
 
-                print(map_file_info)
-                print(custom_resources)
-                #set_lowercase(custom_resources)
+def handle_map(map_path):
+        global custom_resources
+        
+        # Read the resources from the map BSP file
+        read_bsp(map_path)
+        #print(map_file_info)
+        map_name = map_file_info['name']
+        print(map_name)
+
+        # Enforce lowercase on resources.
+        # Usually servers and http fast downloads are linux, which is case sensitive. Clients are windows, which is not
+        # A problem is caused when the case of the file and the string in the entity are different. The server won't find the file.
+        # Note: Sometimes mappers re-use the same resource with different case too, which becomes a mess.
+        # Easiest solution is to enforce lowercase on all files, and write this back to the bsp file
+        if config_data['resources']['enforce_lowercase']:
+                # Turn resource list lowercase
+                custom_resources = [resource.lower() for resource in custom_resources]
                 
-                map_name = map_file_info['name']
-                create_resfile(custom_resources, map_name)
-                
+                # Change the resources on the disk lowercase
+                set_lowercase_disk_resources()
+
+                # Write back the resources as lowercase in the bsp entdata
+                if config_data['resources']['entdata_writeback']:
+                        set_lowercase_entdata_writeback()
+
+        # Create the res file
+        if len(custom_resources) > 0:
+                create_resfile()
+        
+        # Create the zip archive
+        if config_data['archive']['create'] and len(resource_warnings) == 0:
+                # Add these resources after the res file is generated, because we want them in the archive
+                # BUGBUG: TODO: Handle the checking / lowercase on these resources too.
                 add_resource("maps/" + map_name + '.res')
-                add_resource('maps/' + map_name + '.bsp') 
+                add_resource('maps/' + map_name + '.bsp')
                 add_resource('maps/' + map_name + '.txt')
+                create_map_archive()
 
-                if len(resource_warnings) == 0:
-                        create_map_archive(custom_resources, map_name)
-
-                clear_resource_lists()
+        # cleanup before the next map
+        clear_resource_lists()
 
 def clear_resource_lists():
         custom_resources.clear()
@@ -201,37 +228,96 @@ def clear_resource_lists():
         map_file_info.clear()
 
 def is_exist_locally(resource):
-        return os.path.isfile(ROOT_GAME_DIR + os.path.sep + resource)
+        return os.path.isfile(config_data['resources']['input_dir'] + os.path.sep + resource)
 
-def create_map_archive(resource_list, map_name):
-        # Create the output directory if it doesn't exist already
-        zip_output_dir = script_directory + os.path.sep + 'output'
+def create_map_archive():
+        # Check if the output directory specified in the config is absolute or relative
+        zip_output_dir = config_data['archive']['output_dir']
+        if not os.path.isabs(zip_output_dir):
+                zip_output_dir = script_directory + os.path.sep + zip_output_dir
+
+         # Create the output directory if it doesn't exist already
         if (not os.path.exists(zip_output_dir)):
                 os.mkdir(zip_output_dir)
 
         # Create the zip file
-        zip_handle = zipfile.ZipFile(zip_output_dir + os.path.sep + map_name + '.zip', 'w', compression=zipfile.ZIP_DEFLATED)
-        for file in resource_list:
-                zip_handle.write(ROOT_GAME_DIR + file, file)
+        zip_handle = zipfile.ZipFile(zip_output_dir + os.path.sep + map_file_info['name'] + '.zip', 'w', compression=zipfile.ZIP_DEFLATED)
+        for file in custom_resources:
+                try:
+                        zip_handle.write(config_data['resources']['input_dir'] + os.path.sep + file, file)
+                except Exception as e:
+                        print('Failed to add file to zip: '+ str(e))
         zip_handle.close()
 
-def set_lowercase(resource_list):
-        map(str.lower, resource_list) # Set the list to lowercase
+def set_lowercase_disk_resources():
+        # Set resources files on disk to lowercase
+        # BUGBUG: I realise this won't work on linux. Needs rewriting to list the directory and loop through the files.
+        for resource in custom_resources:
+                try:
+                        os.rename(config_data['resources']['input_dir'] + os.path.sep + resource, config_data['resources']['input_dir'] + os.path.sep + resource.lower())
+                except Exception as e:
+                        print('Failed to set to lowercase: '+ str(e))
 
-        # Set actual files to lowercase
-        for resource in resource_list:
-                os.rename(ROOT_GAME_DIR + resource, ROOT_GAME_DIR + resource.lower())
+def set_lowercase_entdata_writeback():
+        print("Writing back entdata")
+        new_entdata_raw = map_file_info['entdata_raw']
+        for resource in custom_resources:
+                # wav files don't need the parent "sound/" directory, remove it.
+                extension = os.path.splitext(resource)[1].lstrip('.')
+                if extension == 'wav': 
+                        resource = resource.replace("sound/", "")
 
-def create_resfile(resource_list, map_name):
-        file_handle = open(ROOT_GAME_DIR + os.path.sep + 'maps' + os.path.sep + map_name + ".res", "w")  
-        file_handle.write('\n'.join(resource_list)) 
+                # BUGBUG TODO: Need to handle "skybox" key e.g. 2Desert becomes 2desert.
+                if extension == 'tga':
+                        continue 
+
+                # Start by escaping the resource string. e.g. "." becomes "\." i.e "ambience/zhans\.wav"
+                resource_escaped = re.escape(resource)
+
+                # Replace the path seperator "/"" so it matches both "\"" and "/""
+                # This is so we can fix mappers that accidently use "\" in their string. Thus screwing up their map.
+                # e.g. A sound with the value "ambience\zhans.wav" ends up bein interpretted by the HL engine as ambience\hans.wav' 
+                pattern = resource_escaped.replace("/", "[\\\\\\/]") # i.e. ambience[\\\/]zhans\.wav 
+                try:
+                        # Case insensitive so "models/xmasblock/Santa_chimney.mdl" becomes "models/xmasblock/santa_chimney.mdl"
+                        # If we have lowercase everywhere, server admins will find it easier to manage the game content on linux game/http:fastdl servers
+                        print(pattern)
+                        map_file_info['entdata_raw'] = re.sub(pattern.encode(map_file_info['entdata_encoding']), resource.encode(map_file_info['entdata_encoding']), map_file_info['entdata_raw'], flags=re.IGNORECASE)
+                except Exception as e:
+                        print('Failed to re.sub entdata for writeback: '+ str(e))
+
+        if len(map_file_info['entdata_raw']) == len(new_entdata_raw):
+                file_handle = open(map_file_info['filename'], mode='r+b') # Open as r+b so we can seek and write in binary
+                file_handle.seek(map_file_info['entdata_start'])
+                file_handle.write(new_entdata_raw)
+                file_handle.close()
+        else:
+                print("Error: Entdata size does not match. Aborting to avoid corrupting the bsp")
+
+        create_entfile(new_entdata_raw, map_file_info['name'] + "_new")
+        create_entfile(map_file_info['entdata_raw'], map_file_info['name'] + "_old")
+
+def create_resfile():
+        file_handle = open(config_data['resources']['input_dir'] + os.path.sep + 'maps' + os.path.sep + map_file_info['name'] + ".res", "w")  
+        file_handle.write("// Generated with goldsrc_map_packer: https://github.com/ben-watch/goldsrc_map_packer\n") # on " + datetime.datetime.now().strftime("%Y-%m-%d") + "\n")
+        file_handle.write('\n'.join(custom_resources)) 
         file_handle.close()
                         
 def read_int(file_handle):
-        return struct.unpack('i', file_handle.read(4))[0]
+        return struct.unpack('i', file_handle.read(4))[0] # int = 4 bytes
+
+def create_entfile(entdata_raw, out_file_name):
+        file_handle = open(config_data['resources']['input_dir'] + os.path.sep + 'maps' + os.path.sep + out_file_name + ".ent", "wb")  
+        file_handle.write(entdata_raw) 
+        file_handle.close()
 
 #pr = cProfile.Profile()
 #pr.enable()
+
+# Load the configuration file
+with open('config.json') as json_data_file:
+    config_data = json.load(json_data_file)
+print(config_data)
 
 read_default_resources()
 read_all_maps()
