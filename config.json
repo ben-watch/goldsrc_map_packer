@@ -6,7 +6,8 @@
 		"check_exists":true,
         "input_dir":"C:\\Program Files (x86)\\Steam\\steamapps\\common\\Half-Life\\tfc_downloads",
         "enforce_lowercase":true,	
-        "entdata_writeback":true	
+        "entdata_writeback":true,
+		"ignore_missing_txt":true
 	},
     "archive":{
         "create":true,

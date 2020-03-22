@@ -13,7 +13,6 @@ script_directory = os.path.dirname((os.path.realpath(__file__)))
 
 default_resources = []
 custom_resources = []
-resource_warnings = []
 map_file_info = {}
 
 def read_bsp(filename):
@@ -110,16 +109,17 @@ def read_bsp(filename):
 def add_resource(resource):
         # Skip already added resources
         if resource in custom_resources:
-                return 1
+                return 0
         
         # Skip default resources
         if is_default_resource(resource):
-                return 1
+                return 0
         
         # Check for bad strings in the resource
         for bad_string in bad_string_contents:
                 if resource.find(bad_string) != -1:
-                        resource_warnings.append("Bad string in value: " + resource)
+                        print("Skipping: Bad string in value: " + resource)
+                        return 0
 
         # Note: Paths in hlds / bsp always uses '/' for path seperators regardless of system. '\' is an escape character. 
         # Sometimes mappers screw up. e.g. "ambience\zhans.wav" equates to ambience\hans.wav'
@@ -127,14 +127,11 @@ def add_resource(resource):
         # The BSP also needs fixing. If the person running this script enables entdata_writeback, we'll fix it there!
         resource = resource.replace("\\", "/")
 
-        # Check if the resource exists locally
-        if config_data['resources']['check_exists'] and is_exist_locally(resource) == 0:
-                resource_warnings.append("File not found: " + resource)
-
         # Add to custom resource list
         custom_resources.append(resource)              
 
         # If the file is a model, check whether the textures are external
+        # BUGBUG: This will check the t.mdl file also TODO: Fix
         resource_file_buf = os.path.splitext(resource)
         if resource_file_buf[1] == '.mdl' and has_mdl_external_texture(resource):
                 add_resource(resource_file_buf[0] + 't.mdl')
@@ -155,8 +152,8 @@ def has_mdl_external_texture(resource):
         model_path = config_data['resources']['input_dir'] + os.path.sep + resource
         try:
                 file_handle = open(model_path, mode='rb')
-        except:
-                resource_warnings.append("Unable to verify model texture file because model is missing: " + resource)
+        except FileNotFoundError:
+                print("File not found. Unable to check for external model texture file: " + resource)
                 return False
 
         file_handle.seek(180) # Skip 180 bytes into the mdl header to get the texture count
@@ -186,45 +183,72 @@ def handle_map(map_path):
         
         # Read the resources from the map BSP file
         read_bsp(map_path)
-        #print(map_file_info)
+
+        do_lowercase = config_data['resources']['enforce_lowercase']
         map_name = map_file_info['name']
-        print(map_name)
+        
+        # First lets set the resources in the list to lowercase
+        if do_lowercase:
+                custom_resources = [resource.lower() for resource in custom_resources]
+
+        print("------------------------------------" + map_name + "------------------------------------")
+
+        # Create the res file
+        resource_count = len(custom_resources)
+        if resource_count == 0:
+                print("[INFO] No custom resources detected. res file not needed")
+        else:
+                create_resfile()
+                print("[DONE] Created resource file " + map_name + ".res. Total: " + str(resource_count) + " custom resources")
+
+        # Add these resources after the res file is generated, because we want to include them in the process below
+                add_resource("maps/" + map_name + '.res')
+        add_resource('maps/' + map_name + '.bsp')
+        add_resource('maps/' + map_name + '.txt')
+
+        # Kind of hacky, but run the lowercase again. TODO: See if this can be completed nicely in the block above
+        if do_lowercase:
+                custom_resources = [resource.lower() for resource in custom_resources]
+
+        # Check if the resources exists locally
+        missing_resource = False
+        if config_data['resources']['check_exists']:
+                for file in custom_resources:
+                        if not is_exist_locally(file):
+                                extension = os.path.splitext(file)[1].lstrip('.')
+                                if extension == 'txt' and config_data['resources']['ignore_missing_txt']: 
+                                        print("[INFO] Local file not found: " + file + " Config: ignore_missing_txt is True. Ignoring")
+                                else:
+                                        print("[ERROR] Local file not found: " + file)
+                                        missing_resource = True
 
         # Enforce lowercase on resources.
         # Usually servers and http fast downloads are linux, which is case sensitive. Clients are windows, which is not
         # A problem is caused when the case of the file and the string in the entity are different. The server won't find the file.
         # Note: Sometimes mappers re-use the same resource with different case too, which becomes a mess.
         # Easiest solution is to enforce lowercase on all files, and write this back to the bsp file
-        if config_data['resources']['enforce_lowercase']:
-                # Turn resource list lowercase
-                custom_resources = [resource.lower() for resource in custom_resources]
-                
+        if do_lowercase:
                 # Change the resources on the disk lowercase
                 set_lowercase_disk_resources()
 
                 # Write back the resources as lowercase in the bsp entdata
+                # This also fixes situations where a mapper uses '\' instead of '/'. The engine sees '\' as an escape char.
                 if config_data['resources']['entdata_writeback']:
                         set_lowercase_entdata_writeback()
-
-        # Create the res file
-        if len(custom_resources) > 0:
-                create_resfile()
+                        print("[DONE] Wrote sanitized entdata to " + map_name + ".bsp. Total: " + str(map_file_info['entdata_size']) + " bytes")
         
         # Create the zip archive
-        if config_data['archive']['create'] and len(resource_warnings) == 0:
-                # Add these resources after the res file is generated, because we want them in the archive
-                # BUGBUG: TODO: Handle the checking / lowercase on these resources too.
-                add_resource("maps/" + map_name + '.res')
-                add_resource('maps/' + map_name + '.bsp')
-                add_resource('maps/' + map_name + '.txt')
-                create_map_archive()
+        if config_data['archive']['create']:
+                if missing_resource:
+                        print("[ERROR] Skipping zip archive creation as local resource files are missing.")
+                else:
+                        create_map_archive()
 
         # cleanup before the next map
         clear_resource_lists()
 
 def clear_resource_lists():
         custom_resources.clear()
-        resource_warnings.clear()
         map_file_info.clear()
 
 def is_exist_locally(resource):
@@ -241,25 +265,30 @@ def create_map_archive():
                 os.mkdir(zip_output_dir)
 
         # Create the zip file
-        zip_handle = zipfile.ZipFile(zip_output_dir + os.path.sep + map_file_info['name'] + '.zip', 'w', compression=zipfile.ZIP_DEFLATED)
+        zip_file_count = 0
+        zip_name = map_file_info['name'] + '.zip'
+        zip_handle = zipfile.ZipFile(zip_output_dir + os.path.sep + zip_name, 'w', compression=zipfile.ZIP_DEFLATED)
         for file in custom_resources:
                 try:
                         zip_handle.write(config_data['resources']['input_dir'] + os.path.sep + file, file)
-                except Exception as e:
-                        print('Failed to add file to zip: '+ str(e))
+                        zip_file_count += 1
+                except FileNotFoundError:
+                        print("[ERROR] File not found. Unable to add resource to archive: " + file)
         zip_handle.close()
 
+        print("[INFO] Added " + str(zip_file_count) + " files to " + zip_name)
+        
+import sys
 def set_lowercase_disk_resources():
         # Set resources files on disk to lowercase
         # BUGBUG: I realise this won't work on linux. Needs rewriting to list the directory and loop through the files.
         for resource in custom_resources:
                 try:
                         os.rename(config_data['resources']['input_dir'] + os.path.sep + resource, config_data['resources']['input_dir'] + os.path.sep + resource.lower())
-                except Exception as e:
-                        print('Failed to set to lowercase: '+ str(e))
+                except:
+                        print("[ERROR] Unable to set resource to lowercase: " + resource)
 
 def set_lowercase_entdata_writeback():
-        print("Writing back entdata")
         new_entdata_raw = map_file_info['entdata_raw']
         for resource in custom_resources:
                 # wav files don't need the parent "sound/" directory, remove it.
@@ -281,7 +310,6 @@ def set_lowercase_entdata_writeback():
                 try:
                         # Case insensitive so "models/xmasblock/Santa_chimney.mdl" becomes "models/xmasblock/santa_chimney.mdl"
                         # If we have lowercase everywhere, server admins will find it easier to manage the game content on linux game/http:fastdl servers
-                        print(pattern)
                         map_file_info['entdata_raw'] = re.sub(pattern.encode(map_file_info['entdata_encoding']), resource.encode(map_file_info['entdata_encoding']), map_file_info['entdata_raw'], flags=re.IGNORECASE)
                 except Exception as e:
                         print('Failed to re.sub entdata for writeback: '+ str(e))
@@ -294,8 +322,8 @@ def set_lowercase_entdata_writeback():
         else:
                 print("Error: Entdata size does not match. Aborting to avoid corrupting the bsp")
 
-        create_entfile(new_entdata_raw, map_file_info['name'] + "_new")
-        create_entfile(map_file_info['entdata_raw'], map_file_info['name'] + "_old")
+        #create_entfile(new_entdata_raw, map_file_info['name'] + "_new")
+        #create_entfile(map_file_info['entdata_raw'], map_file_info['name'] + "_old")
 
 def create_resfile():
         file_handle = open(config_data['resources']['input_dir'] + os.path.sep + 'maps' + os.path.sep + map_file_info['name'] + ".res", "w")  
@@ -317,7 +345,6 @@ def create_entfile(entdata_raw, out_file_name):
 # Load the configuration file
 with open('config.json') as json_data_file:
     config_data = json.load(json_data_file)
-print(config_data)
 
 read_default_resources()
 read_all_maps()
