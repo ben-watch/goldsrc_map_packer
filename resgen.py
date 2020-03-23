@@ -10,6 +10,7 @@ skybox_sides = [ "up", "dn", "lf", "rt", "ft", "bk" ] # The 6 sides of the skybo
 file_types = [ "wad", "tga", "spr", "mdl", "wav" ] # The file types that relate to external resources we want to capture
 bad_string_contents = [ '\\\\', ':', '..' ] # HL will ignore resources read from res files if they contain any of these strings
 script_directory = os.path.dirname((os.path.realpath(__file__)))
+MAX_MAP_TEXTURES = 512
 
 default_resources = []
 custom_resources = []
@@ -21,9 +22,12 @@ def read_bsp(filename):
         map_file_info['filename'] = filename
 
         file_handle = open(filename, mode='rb')
+
+        # Check the BSP version before processing the rest of the file
         bsp_version = map_file_info['bsp_version'] = read_int(file_handle)
-        if bsp_version != 30: # Check the BSP version before processing the rest of the file
-                print('Error: Unexpected BSP version. Check file is a goldsrc map')
+        if bsp_version != 30: 
+                print('[ERROR] Unexpected BSP version. Check file is a goldsrc map')
+                file_handle.close()
                 return 1
 
         # Get the entdata offset and size
@@ -38,43 +42,74 @@ def read_bsp(filename):
         file_handle.seek(tex_data_start) 
         tex_count = map_file_info['tex_count'] = read_int(file_handle)
 
+        if tex_count > MAX_MAP_TEXTURES:
+                print("[ERROR] tex_count > MAX_MAP_TEXTURES: " + str(tex_count))
+                file_handle.close()
+                return 1
+
         # Next x * int blocks are the offsets for each texture. x = texture count
         tex_offset_format = str(tex_count) + 'i' # x * int
         tex_offset_len = struct.calcsize(tex_offset_format) # Get total size of texture offsets number of bytes for x * int
+
         tex_offset_data = struct.unpack(tex_offset_format, file_handle.read(tex_offset_len)) # Read the offsets
-         
-        for tex_offset in tex_offset_data:
+        for i, tex_offset in enumerate(tex_offset_data):
 
                 # Just read the texture mip offset data
                 file_handle.seek(tex_data_start + tex_offset + 24) # 24 = char[16] for texture name, and 2 x int (4 bytes each) for texture width / height
-                tex_mip_offsets = struct.unpack('4i', file_handle.read(struct.calcsize('4i')))# tex_data = struct.unpack('16s6i', file_handle.read(struct.calcsize('16s6i')))
-                
-                # Loop through each mip offset. If the offsets for each mip level are 0 the texture must be in a external texture file
-                for tex_mip_offset in tex_mip_offsets:
-                        if tex_mip_offset == 0:
-                                map_file_info['external_wad'] = True
-                                break # I want to break out twice since we know textures are external now. Using the below statements to do this.
-                        else:
-                                continue  # Only executed if the inner loop did NOT break
-                        break  # Only executed if the inner loop DID break
-                
+                tex_mip_raw = file_handle.read(struct.calcsize('4i'))
+
+                if len(tex_mip_raw) != 0:
+                        tex_mip_offsets = struct.unpack('4i', tex_mip_raw) # tex_data = struct.unpack('16s6i', file_handle.read(struct.calcsize('16s6i')))
+
+                        # Loop through each mip offset. If the offsets for each mip level are 0 the texture must be in a external texture file
+                        for tex_mip_offset in tex_mip_offsets:
+                                if tex_mip_offset == 0:
+                                        map_file_info['external_wad'] = True
+                                        break # I want to break out twice since we know textures are external now. Using the below statements to do this.
+                                else:
+                                        continue  # Only executed if the inner loop did NOT break
+                                break  # Only executed if the inner loop DID break
+                else:
+                        print("[ERROR] No texture mip data for texture: " + str(i))
+                        break
+
         # Seek to the location of the entity data and calculate end offset of entdata
         file_handle.seek(entdata_start) 
 
         # Read the entity data and create an .ent file 
         entdata_raw = map_file_info['entdata_raw'] = file_handle.read(entdata_size)
+        create_entfile(entdata_raw, map_file_info['name'])
 
         # Grab the encoding for later decoding, this is usually acsii, but sometimes not.
         entdata_encoding = map_file_info['entdata_encoding'] = detect(entdata_raw)['encoding']
         entdata_lines = entdata_raw.splitlines()
-        for line in entdata_lines:        
-                if line[0] == 0 or line[0] == 123 or line[0] == 125: # Ignore 0x0, { and }
+
+        for i, line in enumerate(entdata_lines):
+
+                # Fix index errors
+                if len(line) == 0:
                         continue
 
-                # Convert the raw bytes to a string and strip whitespace from end. Typically \n, but instances of \r depending on compiler I guess.
-                line = line.decode(entdata_encoding).rstrip()
+                # Ignore 0x0, { and }
+                if line[0] == 0 or line[0] == 123 or line[0] == 125: 
+                        continue
+
+                # Decode the bytes to a string
+                try:
+                        line = line.decode(entdata_encoding)
+                except:
+                        print("[ERROR] Error decoding line: " + str(i))
+                        break
+
+                # Strip whitespace from end. Typically \n, but instances of \r depending on compiler I guess.
+                # In most cases there is no whitespace at the start, except when people ripent maps to mod the entdata and indent it...
+                line = line.strip()
 
                 keyvalue_pair = line.split(' ', 1)
+                if len(keyvalue_pair) != 2:
+                        print("[ERROR] Bad keyvalue pair. at line: " + str(i))
+                        break
+                
                 ent_key = keyvalue_pair[0].strip('"')
                 ent_value = keyvalue_pair[1].strip('"')
                 
@@ -118,7 +153,7 @@ def add_resource(resource):
         # Check for bad strings in the resource
         for bad_string in bad_string_contents:
                 if resource.find(bad_string) != -1:
-                        print("Skipping: Bad string in value: " + resource)
+                        print("[SKIP] Bad resource string: " + resource)
                         return 0
 
         # Note: Paths in hlds / bsp always uses '/' for path seperators regardless of system. '\' is an escape character. 
@@ -153,7 +188,7 @@ def has_mdl_external_texture(resource):
         try:
                 file_handle = open(model_path, mode='rb')
         except FileNotFoundError:
-                print("File not found. Unable to check for external model texture file: " + resource)
+                print("[ERROR] File not found. Unable to check for external model texture file: " + resource)
                 return False
 
         file_handle.seek(180) # Skip 180 bytes into the mdl header to get the texture count
@@ -178,12 +213,16 @@ def read_all_maps():
         for map_path in map_paths:
                 handle_map(map_path)
 
-def handle_map(map_path):
+def handle_map(map_path):     
         global custom_resources
         
+        print("------------------------------------" + map_path + "------------------------------------")
+
         # Read the resources from the map BSP file
-        read_bsp(map_path)
-        
+        if read_bsp(map_path) == 1:
+                print("[ERROR] Unrecoverable error reading data from: " + map_path + " (Corrupt?)")  
+                return 1
+
         # First lets set the resources in the list to lowercase if enforced
         # Usually servers and http fast downloads are linux, which is case sensitive. Clients are windows, which is not
         # A problem is caused when the case of the file and the string in the entity are different. The server won't find the file.
@@ -193,8 +232,6 @@ def handle_map(map_path):
         if do_lowercase:
                 custom_resources = [resource.lower() for resource in custom_resources]
                 map_name = map_file_info['name'] = map_file_info['name'].lower()
-
-        print("------------------------------------" + map_name + "------------------------------------")
 
         # Create the res file
         resource_count = len(custom_resources)
@@ -233,7 +270,6 @@ def handle_map(map_path):
                 # This function also fixes situations where a mapper uses '\' instead of '/'. The engine sees '\' as an escape char.
                 if config_data['resources']['entdata_writeback']:
                         set_lowercase_entdata_writeback()
-                        print("[DONE] Wrote sanitized entdata to " + map_name + ".bsp. Total: " + str(map_file_info['entdata_size']) + " bytes")
         
         # Create the zip archive
         if config_data['archive']['create']:
@@ -244,6 +280,7 @@ def handle_map(map_path):
 
         # cleanup before the next map
         clear_resource_lists()
+        return 0
 
 def clear_resource_lists():
         custom_resources.clear()
@@ -283,11 +320,13 @@ def set_lowercase_disk_resources():
         for resource in custom_resources:
                 try:
                         os.rename(config_data['resources']['input_dir'] + os.path.sep + resource, config_data['resources']['input_dir'] + os.path.sep + resource.lower())
-                except:
+                except: 
                         print("[ERROR] Unable to set resource to lowercase: " + resource)
 
 def set_lowercase_entdata_writeback():
         new_entdata_raw = map_file_info['entdata_raw']
+        regex_replace_count = 0
+
         for resource in custom_resources:
                 # wav files don't need the parent "sound/" directory, remove it.
                 extension = os.path.splitext(resource)[1].lstrip('.')
@@ -304,21 +343,28 @@ def set_lowercase_entdata_writeback():
                 # Replace the path seperator "/"" so it matches both "\"" and "/""
                 # This is so we can fix mappers that accidently use "\" in their string. Thus screwing up their map.
                 # e.g. A sound with the value "ambience\zhans.wav" ends up bein interpretted by the HL engine as ambience\hans.wav' 
-                pattern = resource_escaped.replace("/", "[\\\\\\/]") # i.e. ambience[\\\/]zhans\.wav 
+                regex_pattern = resource_escaped.replace("/", "[\\\\\\/]") # i.e. ambience[\\\/]zhans\.wav 
                 try:
                         # Case insensitive so "models/xmasblock/Santa_chimney.mdl" becomes "models/xmasblock/santa_chimney.mdl"
                         # If we have lowercase everywhere, server admins will find it easier to manage the game content on linux game/http:fastdl servers
-                        map_file_info['entdata_raw'] = re.sub(pattern.encode(map_file_info['entdata_encoding']), resource.encode(map_file_info['entdata_encoding']), map_file_info['entdata_raw'], flags=re.IGNORECASE)
+                        regex_result = re.subn(regex_pattern.encode(map_file_info['entdata_encoding']), resource.encode(map_file_info['entdata_encoding']), map_file_info['entdata_raw'], flags=re.IGNORECASE)
+                        map_file_info['entdata_raw'] = regex_result[0]
+                        regex_replace_count += regex_result[1]
                 except Exception as e:
-                        print('Failed to re.sub entdata for writeback: '+ str(e))
+                        print('[ERROR] Failed to regex sub entdata during writeback: '+ str(e))
 
         if len(map_file_info['entdata_raw']) == len(new_entdata_raw):
-                file_handle = open(map_file_info['filename'], mode='r+b') # Open as r+b so we can seek and write in binary
-                file_handle.seek(map_file_info['entdata_start'])
-                file_handle.write(new_entdata_raw)
-                file_handle.close()
+                if regex_replace_count > 0:
+                        file_handle = open(map_file_info['filename'], mode='r+b') # Open as r+b so we can seek and write in binary
+                        file_handle.seek(map_file_info['entdata_start'])
+                        file_handle.write(new_entdata_raw)
+                        file_handle.close()
+                        print("[DONE] Wrote sanitized entdata to " + map_file_info['name'] + ".bsp. Replaced " + str(regex_replace_count) + " values. Total: " + str(map_file_info['entdata_size']) + " bytes")
+                else:
+                         print("[SKIP] Entdata writeback not required. " + map_file_info['name'] + ".bsp is OK!")
+
         else:
-                print("Error: Entdata size does not match. Aborting to avoid corrupting the bsp")
+                print("[ERROR] Entdata size does not match. Aborting to avoid corrupting the bsp")
 
         #create_entfile(new_entdata_raw, map_file_info['name'] + "_new")
         #create_entfile(map_file_info['entdata_raw'], map_file_info['name'] + "_old")
