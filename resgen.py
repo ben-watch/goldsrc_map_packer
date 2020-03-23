@@ -90,25 +90,27 @@ def read_bsp(filename):
                 if len(line) == 0:
                         continue
 
+                # Strip whitespace from end. Typically \n, but instances of \r depending on compiler I guess.
+                # In most cases there is no whitespace at the start, except when people ripent maps to mod the entdata...
+                line = line.strip()
+
                 # Ignore 0x0, { and }
                 if line[0] == 0 or line[0] == 123 or line[0] == 125: 
                         continue
 
                 # Decode the bytes to a string
+                # TODO: Maybe try and profile this vs decoding the entire entdata at once outside the loop.
+                # TODO: Break out and return 1 instead
                 try:
                         line = line.decode(entdata_encoding)
                 except:
-                        print("[ERROR] Error decoding line: " + str(i))
+                        print("[ERROR] Error decoding line: " + str(i + 1))
                         break
-
-                # Strip whitespace from end. Typically \n, but instances of \r depending on compiler I guess.
-                # In most cases there is no whitespace at the start, except when people ripent maps to mod the entdata and indent it...
-                line = line.strip()
 
                 keyvalue_pair = line.split(' ', 1)
                 if len(keyvalue_pair) != 2:
-                        print("[ERROR] Bad keyvalue pair. at line: " + str(i))
-                        break
+                        print("[ERROR] Bad keyvalue pair at line: " + str(i + 1))
+                        break # TODO: Break out and return 1 instead
                 
                 ent_key = keyvalue_pair[0].strip('"')
                 ent_value = keyvalue_pair[1].strip('"')
@@ -391,7 +393,8 @@ with open('config.json') as json_data_file:
     config_data = json.load(json_data_file)
 
 read_default_resources()
-read_all_maps()
+handle_map("C:\\Program Files (x86)\\Steam\\steamapps\\common\\Half-Life\\tfc_downloads\\maps\\shipwrecked_pt2.bsp")
+# read_all_maps()
      
 #pr.disable()
 #pr.print_stats(sort='tottime')
